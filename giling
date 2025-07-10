@@ -1,0 +1,231 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <math.h>
+
+// Informasi WiFi dan Telegram
+const char* ssid = "PABRIK";
+const char* password = "sidoarjo";
+String BOT_TOKEN = "8087052988:AAFezlvb4lZgexJTZkJ9jt7K0uebjIn1_Ec";
+String CHAT_ID = "-1002779156705";
+
+// LCD dan client HTTPS
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+WiFiClientSecure client;
+
+// Status dan pengaturan
+float teganganTerakhir = 0.0;
+String statusTerakhir = "BELUM ADA";
+unsigned long lastStopDetected = 0;
+unsigned long lastHourlyNotif = 0;
+const long intervalStopNotif = 60000;
+const long intervalHourly = 7200000;
+const long thresholdBerhenti = 600000;
+const float calibration = 311.0;
+bool isRunning = false;
+bool alreadyNotifiedStop = false;
+bool sedangBerhenti = false;
+typedef unsigned long timestamp;
+timestamp waktuMulaiBerhenti = 0;
+
+// Penundaan saat mulai giling
+unsigned long waktuMulaiGiling = 0;
+bool siapKirimNotifikasiGiling = false;
+
+// LED
+#define LED_HIJAU 2
+#define LED_MERAH 27
+
+// LCD interval
+unsigned long lastLCDUpdate = 0;
+const unsigned long lcdInterval = 1000;
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin(21, 22);
+  lcd.begin(16, 2);
+  lcd.backlight();
+
+  pinMode(LED_HIJAU, OUTPUT);
+  pinMode(LED_MERAH, OUTPUT);
+  digitalWrite(LED_HIJAU, LOW);
+  digitalWrite(LED_MERAH, LOW);
+
+  // Animasi koneksi WiFi
+  lcd.setCursor(0, 0);
+  lcd.print("Menghubungkan...");
+  lcd.setCursor(0, 1);
+  int dotCount = 0;
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    lcd.setCursor(0, 1);
+    lcd.print("                ");
+    for (int i = 0; i < dotCount + 1; i++) {
+      lcd.setCursor(i * 2, 1);
+      lcd.print(".");
+    }
+    dotCount = (dotCount + 1) % 8;
+    delay(500);
+    Serial.print(".");
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi Terhubung");
+  delay(2000);
+
+  client.setInsecure();  // Lewati verifikasi sertifikat
+}
+
+void loop() {
+  maintainWiFi();
+
+  float voltage = readZMPT101B();
+  voltage += 106.0;
+  if (voltage < 180.0) voltage = 0.0;
+
+  bool currentStatus = voltage >= 180.0;
+  teganganTerakhir = voltage;
+  statusTerakhir = currentStatus ? "GILING BERJALAN" : "GILING BERHENTI";
+
+  digitalWrite(LED_HIJAU, currentStatus ? HIGH : LOW);
+  digitalWrite(LED_MERAH, currentStatus ? LOW : HIGH);
+
+  unsigned long now = millis();
+
+  // Update LCD
+  if (now - lastLCDUpdate >= lcdInterval) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print((WiFi.status() == WL_CONNECTED) ? "WiFi ON, " : "WiFi OFF, ");
+    lcd.print(voltage, 0);
+    lcd.print("VAC");
+    lcd.setCursor(0, 1);
+    lcd.print(statusTerakhir);
+    lastLCDUpdate = now;
+  }
+
+  // Mulai giling lagi setelah stabil 60 detik
+  if (currentStatus && !isRunning) {
+    if (!siapKirimNotifikasiGiling) {
+      waktuMulaiGiling = now;
+      siapKirimNotifikasiGiling = true;
+    }
+
+    if (siapKirimNotifikasiGiling && (now - waktuMulaiGiling >= 60000)) {
+      if (sedangBerhenti && (now - waktuMulaiBerhenti) >= thresholdBerhenti) {
+        unsigned long totalBerhenti = now - waktuMulaiBerhenti;
+        kirimTelegram("GILING BERHENTI selama " + formatWaktu(totalBerhenti));
+      }
+
+      kirimTelegram("GILING BERJALAN");
+      isRunning = true;
+      alreadyNotifiedStop = false;
+      sedangBerhenti = false;
+      lastHourlyNotif = now;
+      siapKirimNotifikasiGiling = false;
+    }
+  } else if (!currentStatus) {
+    siapKirimNotifikasiGiling = false;
+  }
+
+  // Saat berhenti
+  if (!currentStatus) {
+    if (isRunning && !alreadyNotifiedStop) {
+      if (lastStopDetected == 0) {
+        lastStopDetected = now;
+        waktuMulaiBerhenti = now;
+        sedangBerhenti = true;
+      } else if (now - lastStopDetected >= intervalStopNotif) {
+        kirimTelegram("GILING BERHENTI");
+        alreadyNotifiedStop = true;
+        isRunning = false;
+        lastStopDetected = 0;
+      }
+    }
+  } else {
+    lastStopDetected = 0;
+  }
+
+  // Pengingat 2 jam
+  if (isRunning && now - lastHourlyNotif >= intervalHourly) {
+    kirimTelegram("GILING BERJALAN (pengingat)");
+    lastHourlyNotif = now;
+  }
+
+  delay(100);
+}
+
+float readZMPT101B() {
+  int samples = 200;
+  float sum = 0;
+  for (int i = 0; i < samples; i++) {
+    int adc = analogRead(34);
+    float volt = ((float)adc * 3.3 / 4095.0) - (3.3 / 2.0);
+    sum += volt * volt;
+    delayMicroseconds(1000);
+  }
+  float rms = sqrt(sum / samples);
+  return rms * calibration;
+}
+
+void kirimTelegram(String pesan) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient https;
+    String url = "https://api.telegram.org/bot" + BOT_TOKEN +
+                 "/sendMessage?chat_id=" + CHAT_ID +
+                 "&text=" + urlencode(pesan) + "&parse_mode=Markdown";
+
+    https.begin(client, url);
+    int code = https.GET();
+    if (code > 0) {
+      Serial.println("Telegram: " + pesan);
+    } else {
+      Serial.println("Gagal Telegram: " + String(code));
+    }
+    https.end();
+  }
+}
+
+String urlencode(String str) {
+  String encoded = "";
+  char c;
+  for (int i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    if (isalnum(c)) {
+      encoded += c;
+    } else {
+      encoded += '%';
+      encoded += "0123456789ABCDEF"[c >> 4];
+      encoded += "0123456789ABCDEF"[c & 15];
+    }
+  }
+  return encoded;
+}
+
+void maintainWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi putus, menyambung ulang...");
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+    int retry = 0;
+    while (WiFi.status() != WL_CONNECTED && retry < 20) {
+      delay(500);
+      retry++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("WiFi tersambung ulang.");
+    } else {
+      Serial.println("WiFi gagal tersambung ulang.");
+    }
+  }
+}
+
+String formatWaktu(unsigned long millisInput) {
+  unsigned long totalSeconds = millisInput / 1000;
+  int minutes = totalSeconds / 60;
+  int seconds = totalSeconds % 60;
+  return String(minutes) + " menit " + String(seconds) + " detik";
+}
